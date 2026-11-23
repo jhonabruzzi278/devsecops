@@ -2,25 +2,35 @@
 @file app.py
 @brief "Sistema Alumnos" de SecureDev: API y portal web de alumnos (Evaluación Parcial 3, OCY1102).
 
-Además de las rutas de negocio, la app publica métricas para Prometheus en /metrics.
-Las métricas de seguridad (logins fallidos y peticiones sospechosas) se ven en Grafana.
+VERSIÓN CORREGIDA (solución docente). Cada corrección está marcada con su identificador VULN-xx
+(ver DOCENTE/PAUTA_DOCENTE.md). VULN-09 (dependencias) está en requirements.txt y .github/dependabot.yml.
 """
-import hashlib
+import hmac
 import os
 import re
+import secrets
 import sqlite3
 import time
+from collections import defaultdict, deque
 
-from flask import Flask, Response, g, jsonify, render_template_string, request
+from flask import Flask, Response, abort, g, jsonify, render_template_string, request, session
+from markupsafe import escape
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from werkzeug.security import check_password_hash
 
 app = Flask(__name__)
 
-## Clave de la aplicación y credenciales del administrador.
-SECRET_KEY = "SecureDev-2024-clave-super-secreta"
-ADMIN_USUARIO = "admin"
-ADMIN_CLAVE_MD5 = "21232f297a57a5a743894a0e4a801fc3"
-app.config["SECRET_KEY"] = SECRET_KEY
+# VULN-03: sin secretos en el código. Se leen del entorno; si faltan, la clave es aleatoria
+# y el acceso de administrador queda deshabilitado.
+app.config.update(
+    SECRET_KEY=os.environ.get("SECRET_KEY") or secrets.token_hex(32),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Strict",
+)
+## Usuario administrador.
+ADMIN_USUARIO = os.environ.get("ADMIN_USUARIO", "admin")
+## Hash (scrypt/pbkdf2 de Werkzeug) de la clave del administrador. VULN-04: hash lento con sal, no un hash rápido.
+ADMIN_CLAVE_HASH = os.environ.get("ADMIN_CLAVE_HASH", "")
 
 ## Versión desplegada: la inyecta el pipeline (1.0.<build>+<commit>). Sirve para la trazabilidad.
 VERSION = os.environ.get("APP_VERSION", "dev")
@@ -39,6 +49,7 @@ HTTP_PETICIONES = Counter("http_requests_total", "Peticiones HTTP atendidas", ["
 HTTP_LATENCIA = Histogram("http_request_duration_seconds", "Duración de las peticiones HTTP", ["endpoint"])
 LOGIN_FALLIDOS = Counter("login_fallidos_total", "Intentos de inicio de sesión fallidos")
 LOGIN_EXITOSOS = Counter("login_exitosos_total", "Inicios de sesión correctos")
+LOGIN_BLOQUEADOS = Counter("login_bloqueados_total", "Intentos rechazados por bloqueo temporal (fuerza bruta)")
 SOSPECHOSAS = Counter("peticiones_sospechosas_total", "Peticiones con patrones de ataque", ["tipo"])
 APP_INFO = Gauge("app_info", "Versión desplegada de la aplicación", ["version"])
 APP_INFO.labels(version=VERSION).set(1)
@@ -49,6 +60,12 @@ PATRONES_ATAQUE = {
     "sqli": re.compile(r"('|%27)\s*(or|and|union)\b|union\s+select|--|;\s*drop\b|sleep\(", re.I),
     "path_traversal": re.compile(r"\.\./|\.\.\\|%2e%2e", re.I),
 }
+
+## VULN-08 (respuesta al incidente de fuerza bruta): máximo de fallos por IP dentro de la ventana.
+MAX_FALLOS = 5
+## Ventana (segundos) del bloqueo temporal.
+VENTANA_S = 300
+_fallos_por_ip = defaultdict(deque)
 
 PORTADA = """<!doctype html>
 <html lang="es">
@@ -67,6 +84,7 @@ PORTADA = """<!doctype html>
 </form>
 <h2>Acceso administrador</h2>
 <form action="/login" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <input name="usuario" value="admin"> <input name="clave" type="password" value="">
   <button type="submit">Entrar</button>
 </form>
@@ -108,6 +126,16 @@ def iniciar_db():
     db.close()
 
 
+def token_csrf():
+    """!
+    @brief VULN-07: token anti-CSRF guardado en la sesión (uno por navegador).
+    @return Token aleatorio.
+    """
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+    return session["csrf_token"]
+
+
 @app.before_request
 def antes_de_la_peticion():
     """!
@@ -124,14 +152,25 @@ def antes_de_la_peticion():
 @app.after_request
 def despues_de_la_peticion(respuesta):
     """!
-    @brief Registra la métrica de cada petición atendida.
+    @brief Registra la métrica de cada petición y agrega las cabeceras de seguridad (VULN-06).
     @param respuesta Respuesta que Flask enviará al cliente.
-    @return La misma respuesta.
+    @return La misma respuesta con cabeceras de seguridad.
     """
     endpoint = request.url_rule.rule if request.url_rule else "desconocido"
     if endpoint != "/metrics":
         HTTP_PETICIONES.labels(request.method, endpoint, str(respuesta.status_code)).inc()
         HTTP_LATENCIA.labels(endpoint).observe(time.perf_counter() - g.get("inicio", time.perf_counter()))
+    respuesta.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; "
+        "object-src 'none'; frame-ancestors 'none'; form-action 'self'; base-uri 'self'"
+    )
+    respuesta.headers["X-Frame-Options"] = "DENY"
+    respuesta.headers["X-Content-Type-Options"] = "nosniff"
+    respuesta.headers["Referrer-Policy"] = "no-referrer"
+    respuesta.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    respuesta.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    respuesta.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    respuesta.headers["Cache-Control"] = "no-store"
     return respuesta
 
 
@@ -141,17 +180,17 @@ def portada():
     @brief Portada HTML con enlaces y formularios del sistema.
     @return Página HTML.
     """
-    return render_template_string(PORTADA, version=VERSION)
+    return render_template_string(PORTADA, version=VERSION, csrf_token=token_csrf())
 
 
 @app.route("/hello")
 def hello():
     """!
     @brief Saluda al usuario cuyo nombre llega en el parámetro de URL «name».
-    @return Página HTML con el saludo.
+    @return Página HTML con el saludo (VULN-01: el nombre se escapa).
     """
     name = request.args.get("name", "visitante")
-    return f"<h1>Hola, {name}!</h1>"
+    return f"<h1>Hola, {escape(name)}!</h1>"
 
 
 @app.route("/health")
@@ -199,30 +238,47 @@ def obtener_alumno(alumno_id):
 def buscar_alumnos():
     """!
     @brief Busca alumnos cuyo nombre contenga el texto del parámetro «nombre».
-    @return JSON con los alumnos encontrados.
+    @return JSON con los alumnos encontrados (VULN-02: consulta parametrizada, sin detalles del error).
     """
-    nombre = request.args.get("nombre", "")
-    consulta = f"SELECT * FROM alumnos WHERE nombre LIKE '%{nombre}%'"
-    try:
-        filas = conectar().execute(consulta).fetchall()
-    except sqlite3.Error as error:
-        return jsonify({"error": str(error), "consulta": consulta}), 500
+    nombre = request.args.get("nombre", "")[:100]
+    filas = conectar().execute("SELECT * FROM alumnos WHERE nombre LIKE ?", (f"%{nombre}%",)).fetchall()
     return jsonify([dict(f) for f in filas])
+
+
+def ip_bloqueada(ip):
+    """!
+    @brief Indica si la IP superó el máximo de logins fallidos en la ventana de tiempo.
+    @param ip Dirección IP del cliente.
+    @return True si debe rechazarse el intento.
+    """
+    intentos = _fallos_por_ip[ip]
+    while intentos and time.monotonic() - intentos[0] > VENTANA_S:
+        intentos.popleft()
+    return len(intentos) >= MAX_FALLOS
 
 
 @app.route("/login", methods=["POST"])
 def login():
     """!
     @brief Valida las credenciales del administrador enviadas por formulario.
-    @return JSON con el resultado; 401 si las credenciales no son válidas.
+    @return JSON con el resultado; 401 si no son válidas, 429 si la IP está bloqueada.
     """
+    esperado = session.get("csrf_token")
+    if not esperado or not hmac.compare_digest(request.form.get("csrf_token", ""), esperado):
+        abort(400, "Token CSRF inválido")
+    ip = request.remote_addr or "desconocida"
+    if ip_bloqueada(ip):
+        LOGIN_BLOQUEADOS.inc()
+        return jsonify({"error": "Demasiados intentos. Espera 5 minutos."}), 429
     usuario = request.form.get("usuario", "")
     clave = request.form.get("clave", "")
-    if usuario == ADMIN_USUARIO and hashlib.md5(clave.encode()).hexdigest() == ADMIN_CLAVE_MD5:
+    if ADMIN_CLAVE_HASH and hmac.compare_digest(usuario, ADMIN_USUARIO) and check_password_hash(ADMIN_CLAVE_HASH, clave):
+        _fallos_por_ip.pop(ip, None)
         LOGIN_EXITOSOS.inc()
         return jsonify({"mensaje": "Bienvenido, administrador"})
+    _fallos_por_ip[ip].append(time.monotonic())
     LOGIN_FALLIDOS.inc()
-    app.logger.warning("Login fallido para el usuario '%s' desde %s", usuario, request.remote_addr)
+    app.logger.warning("Login fallido desde %s", ip)
     return jsonify({"error": "Credenciales inválidas"}), 401
 
 
@@ -238,4 +294,5 @@ def metrics():
 iniciar_db()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # VULN-05: sin modo debug y solo en localhost (el despliegue real usa gunicorn).
+    app.run(host=os.environ.get("FLASK_HOST", "127.0.0.1"), port=5000, debug=os.environ.get("FLASK_DEBUG") == "1")
