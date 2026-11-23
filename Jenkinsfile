@@ -49,12 +49,61 @@ pipeline {
             }
         }
 
-        // >>> [SEGURIDAD] (paso 4): aquí van las etapas "Security Review (SAST)" y "Dependency Management"
+        stage('Security Review (SAST)') {
+            steps {
+                // Si Bandit encuentra algo Medium o High, el build queda UNSTABLE (amarillo) y sigue.
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                    sh '''
+                        bandit app.py -f json -o reports/bandit.json --exit-zero -q
+                        bandit app.py -f txt  -o reports/bandit.txt  --exit-zero -q
+                        cat reports/bandit.txt
+                        bandit app.py -ll -q
+                    '''
+                }
+            }
+        }
 
-        // >>> [ZAP] (paso 5): aquí van las etapas "Deploy Staging" y "DAST - OWASP ZAP"
+        stage('Dependency Management') {
+            steps {
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                    sh '''
+                        estado=0
+                        echo "== pip-audit: vulnerabilidades conocidas (CVE) en requirements.txt"
+                        pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true
+                        pip-audit -r requirements.txt > reports/pip-audit.txt 2>&1 || estado=1
+                        cat reports/pip-audit.txt
+                        echo "== Dependencias desactualizadas (informativo)"
+                        .venv/bin/pip list --outdated | tee reports/dependencias-desactualizadas.txt
+                        echo "== Política: Dependabot debe vigilar las dependencias pip"
+                        if grep -Eqs 'package-ecosystem: *"?pip"?' .github/dependabot.yml; then
+                            echo "OK: .github/dependabot.yml vigila pip"
+                        else
+                            echo "FALTA .github/dependabot.yml con package-ecosystem pip"; estado=1
+                        fi
+                        exit $estado
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Staging') {
+            steps {
+                sh 'bash scripts/deploy.sh staging 5001'
+            }
+        }
+
+        stage('DAST - OWASP ZAP') {
+            steps {
+                // ZAP ataca staging (no producción). Alertas High o Medium = UNSTABLE.
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                    sh 'python3 scripts/zap_scan.py http://jenkins:5001'
+                }
+            }
+        }
 
         stage('Deploy Producción') {
-            // >>> [GATE] (paso 5): aquí va la condición "when" que protege producción
+            // Gate de seguridad: solo llega a producción un build sin hallazgos (SUCCESS).
+            when { expression { currentBuild.currentResult == 'SUCCESS' } }
             steps {
                 sh 'bash scripts/deploy.sh produccion 5000'
                 script { env.PRODUCCION = env.APP_VERSION }
