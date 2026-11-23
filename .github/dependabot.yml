@@ -7,8 +7,6 @@ updates:
     schedule:
       interval: "daily"
     open-pull-requests-limit: 5
-    labels:
-      - "dependencias"
     commit-message:
       prefix: "deps"
     # Un solo PR con todas las actualizaciones: Flask, Werkzeug y Jinja2 deben subir juntos.
