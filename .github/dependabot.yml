@@ -1,0 +1,20 @@
+# Dependabot: revisa las dependencias de Python (requirements*.txt) y abre Pull Requests.
+# Jenkins valida cada cambio fusionado (pruebas, Bandit, pip-audit y ZAP) antes de llegar a producción.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencias"
+    commit-message:
+      prefix: "deps"
+    # Un solo PR con todas las actualizaciones: Flask, Werkzeug y Jinja2 deben subir juntos.
+    groups:
+      dependencias-python:
+        patterns: ["*"]
+      seguridad-python:
+        applies-to: security-updates
+        patterns: ["*"]
